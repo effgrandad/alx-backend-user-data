@@ -8,124 +8,100 @@ info in logs for processing purposes
 PII_FIELDS = ("name", "email", "ssn", "password", "phone")
 
 
-import logging  # noqa E402
-import re  # noqa E402
-from typing import List  # noqa E402
-from mysql.connector.connection import MySQLConnection  # noqa E402
-from os import environ  # noqa E402
+import os
+import re
+import logging
+import mysql.connector
+from typing import List
 
 
-def filter_datum(fields: List[str], redaction: str,
-                 message: str, separator: str) -> str:
+patterns = {
+    'extract': lambda x, y: r'(?P<field>{})=[^{}]*'.format('|'.join(x), y),
+    'replace': lambda x: r'\g<field>={}'.format(x),
+}
+PII_FIELDS = ("name", "email", "phone", "ssn", "password")
+
+
+def filter_datum(
+        fields: List[str], redaction: str, message: str, separator: str,
+        ) -> str:
+    """Filters a log line.
     """
-    A simple function to filter some field from
-    a message, given the seperator
-    Args:
-        fields (list):  a list of fields to filter
-        redaction (str): What to replace the fileds with
-        message (str): the message to obfuscate
-        seperator (str):  the message seperator
-    Returns:
-        returns a string
-    -----------------------------------------------
-    Example:
-        message = "name=egg;email=eggmin@eggsample.com;pwd=eggcellent"
-        filtered = filter_datum(["email", "pwd"], "***", message, ";")
-        # should return "name=egg;email=***;pwd=***
-    Exceptions:
-        raises TypeError if the args are not of the valid type
-    """
-    # if not isinstance(fields, list) or not isinstance(redaction, str)\
-    #     or not isinstance(message, str) or not isinstance(separator, str):
-    #     raise TypeError('Check your param')
+    extract, replace = (patterns["extract"], patterns["replace"])
+    return re.sub(extract(fields, separator), replace(redaction), message)
 
-    for field in fields:
-        message = re.sub(f'{field}=.*?{separator}',
-                     f'{field}={redaction}{separator}', message)  # noqa E128
-    return message
+
+def get_logger() -> logging.Logger:
+    """Creates a new logger for user data.
+    """
+    logger = logging.getLogger("user_data")
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(RedactingFormatter(PII_FIELDS))
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    logger.addHandler(stream_handler)
+    return logger
+
+
+def get_db() -> mysql.connector.connection.MySQLConnection:
+    """Creates a connector to a database.
+    """
+    db_host = os.getenv("PERSONAL_DATA_DB_HOST", "localhost")
+    db_name = os.getenv("PERSONAL_DATA_DB_NAME", "")
+    db_user = os.getenv("PERSONAL_DATA_DB_USERNAME", "root")
+    db_pwd = os.getenv("PERSONAL_DATA_DB_PASSWORD", "")
+    connection = mysql.connector.connect(
+        host=db_host,
+        port=3306,
+        user=db_user,
+        password=db_pwd,
+        database=db_name,
+    )
+    return connection
+
+
+def main():
+    """Logs the information about user records in a table.
+    """
+    fields = "name,email,phone,ssn,password,ip,last_login,user_agent"
+    columns = fields.split(',')
+    query = "SELECT {} FROM users;".format(fields)
+    info_logger = get_logger()
+    connection = get_db()
+    with connection.cursor() as cursor:
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        for row in rows:
+            record = map(
+                lambda x: '{}={}'.format(x[0], x[1]),
+                zip(columns, row),
+            )
+            msg = '{};'.format('; '.join(list(record)))
+            args = ("user_data", logging.INFO, None, None, msg, None, None)
+            log_record = logging.LogRecord(*args)
+            info_logger.handle(log_record)
 
 
 class RedactingFormatter(logging.Formatter):
     """ Redacting Formatter class
-        """
+    """
 
     REDACTION = "***"
     FORMAT = "[HOLBERTON] %(name)s %(levelname)s %(asctime)-15s: %(message)s"
+    FORMAT_FIELDS = ('name', 'levelname', 'asctime', 'message')
     SEPARATOR = ";"
 
     def __init__(self, fields: List[str]):
-        """
-        The constructor for the RedactingFormatter
-        Args:
-            fields (list): A list of fields to redact
-        """
         super(RedactingFormatter, self).__init__(self.FORMAT)
         self.fields = fields
 
     def format(self, record: logging.LogRecord) -> str:
+        """formats a LogRecord.
         """
-        Format a log message by removing the PIII
-        Args:
-            record (logRecord): The log record to format
-        Returns:
-            returns a string
-        """
-        record.msg = filter_datum(self.fields, RedactingFormatter.REDACTION,
-                        record.getMessage(), RedactingFormatter.SEPARATOR)  # noqa E128
-        return super(RedactingFormatter, self).format(record)
-
-
-def get_logger() -> logging.Logger:
-    """
-    function returns a Logger object
-    Args:
-        doesn't take any arguments
-    Returns:
-        returns a Logger
-    """
-    holbie_logger = logging.getLogger("user_data")
-    holbie_logger.setLevel(logging.INFO)
-    handler = logging.StreamHandler()
-    handler.setFormatter(RedactingFormatter(PII_FIELDS))
-    holbie_logger.propagate = False
-    return holbie_logger
-
-
-def get_db() -> MySQLConnection:
-    """
-    connect to a database securely using
-    mysql.connector
-    ------------------------------------
-    Example:
-        db_obj = get_db()
-        db_objet.cursor().execute(query)
-    """
-    DB_CREDS_STUB = {
-        "username": environ.get("PERSONAL_DATA_DB_USERNAME", "root"),
-        "password": environ.get("PERSONAL_DATA_DB_PASSWORD", "root"),
-        "database": environ.get("PERSONAL_DATA_DB_NAME", "my_db"),
-        "host": environ.get("PERSONAL_DATA_DB_HOST", "localhost")
-    }
-    return MySQLConnection(**DB_CREDS_STUB)
-
-
-def main():
-    """
-    Starting point for the script
-    retrieves users from the database and logs
-    the records with PII stripped
-    """
-    logger = get_logger()
-    connection = get_db()
-    cursor = connection.cursor()
-    cursor.execute("SELECT * FROM users")
-    fields = [entry[0] for entry in cursor.description]
-    # return cursor.fetchall()
-    for row in cursor:
-        record_wit_fields = "".join(f"{i} {str(j)}" for i, j in zip(row, fields)).strip()
-        logger.info(record_wit_fields)
-    # return fields
+        msg = super(RedactingFormatter, self).format(record)
+        txt = filter_datum(self.fields, self.REDACTION, msg, self.SEPARATOR)
+        return txt
 
 
 if __name__ == "__main__":
-    print(main())
+    main()
